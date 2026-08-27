@@ -1,0 +1,140 @@
+# =======================================================================
+# Uniaxial compression of a re-entrant bow-tie auxetic Al lattice (EAM)
+#
+# Geometry:  lattice_auxetic.data   (from generate_auxetic_lattice.py)
+# Potential: Al99.eam.alloy
+#   Y. Mishin, D. Farkas, M.J. Mehl, D.A. Papaconstantopoulos,
+#   Phys. Rev. B 59, 3393 (1999); LAMMPS setfl file, NIST IPR.
+#   Required usage (from the potential file's own release notes):
+#       units metal ; atom_style atomic
+#       pair_style eam/alloy ; pair_coeff * * Al99.eam.alloy Al
+# =======================================================================
+
+# ---------------------- 1. Initialization -----------------------------
+units           metal
+dimension       3
+boundary        s s p          # shrink-wrapped x,y (finite/free lattice), periodic z (quasi-2D slab)
+atom_style      atomic
+
+read_data       lattice_auxetic.data
+
+# ---------------------- 2. Potential -----------------------------------
+pair_style      eam/alloy
+pair_coeff      * * Al99.eam.alloy Al
+
+neighbor        2.0 bin
+neigh_modify    delay 5 every 1 check yes
+
+# ---------------------- 3. Define grip / mobile groups -----------------
+# Grab a thin slab of atoms at the very bottom (fixed support) and very
+# top (moving grip) of the structure, matching the support-triangle row
+# and the loaded row in the figure.
+variable        grip equal 8.0                 # grip thickness [A]
+variable        ylo  equal bound(all,ymin)
+variable        yhi  equal bound(all,ymax)
+
+region          rbot block INF INF ${ylo} $(v_ylo+v_grip) INF INF units box
+region          rtop block INF INF $(v_yhi-v_grip) ${yhi} INF INF units box
+
+group           gbottom region rbot
+group           gtop    region rtop
+group           gmobile subtract all gbottom gtop
+
+variable        natoms_bot equal count(gbottom)
+variable        natoms_top equal count(gtop)
+variable        natoms_mid equal count(gmobile)
+print           "Bottom grip atoms: ${natoms_bot}  Top grip atoms: ${natoms_top}  Mobile atoms: ${natoms_mid}"
+
+# initial reference lengths (frozen at parse time with $(...) )
+variable        y0_top equal $(xcm(gtop,y))
+variable        y0_bot equal $(xcm(gbottom,y))
+variable        H0     equal $(v_y0_top-v_y0_bot)         # initial gauge height
+variable        A0     equal $(lx*lz)                      # initial cross-section (x-width * z-depth)
+
+print           "Initial gauge height H0 = ${H0} A ; cross-section A0 = ${A0} A^2"
+
+# ---------------------- 4. Energy minimization (relax as-built lattice) -
+# The bottom grip is completely excluded from time integration below, so
+# leaving it out of the minimize group as well keeps it perfectly fixed.
+fix             freeze_bot gbottom setforce 0.0 0.0 0.0
+min_style       cg
+minimize        1.0e-10 1.0e-12 10000 100000
+unfix           freeze_bot
+
+# ---------------------- 5. Thermostat setup -----------------------------
+variable        Tset equal 300.0
+
+velocity        gmobile create ${Tset} 12345 mom yes rot yes dist gaussian
+velocity        gtop    set 0.0 0.0 0.0
+velocity        gbottom set 0.0 0.0 0.0
+
+# temperature compute restricted to the truly thermal (mobile) atoms only,
+# so the frozen grip / prescribed-velocity grip don't distort the DOF count
+compute         cTmobile gmobile temp
+
+fix             fnvt   gmobile nvt temp ${Tset} ${Tset} 0.1
+fix_modify      fnvt temp cTmobile
+
+# short thermalization run with grips held before loading starts
+fix             fholdbot gbottom setforce 0.0 0.0 0.0
+fix             fholdtop gtop    setforce 0.0 0.0 0.0
+timestep        0.001                 # 1 fs
+thermo          200
+thermo_style    custom step temp pe press
+run             5000
+unfix           fholdbot
+unfix           fholdtop
+
+# ---------------------- 6. Displacement-controlled compression ---------
+# Bottom grip: excluded from every integrating fix below -> stays fixed.
+# Top grip: driven at constant velocity in -y with fix move (kinematic;
+# LAMMPS "fix move" documentation: linear style moves atoms at a constant
+# prescribed velocity, x/z components NULL below = follow normal dynamics
+# is NOT wanted here, so x,z are explicitly pinned to 0 as well).
+variable        strain_rate equal 5.0e-4      # 1/ps  (choose to suit H0; see notes)
+variable        vy equal -v_strain_rate*v_H0  # [A/ps], negative = downward/compressive
+
+fix             fmovetop gtop move linear 0.0 ${vy} 0.0 units box
+fix             fsetbot  gbottom setforce 0.0 0.0 0.0   # rigid: zero net force -> stays put
+
+# ---------------------- 7. Stress / strain bookkeeping ------------------
+# CROSS-CHECKED BUG FIX: do NOT use `compute reduce sum fy` on gbottom here.
+# `fix fsetbot ... setforce 0 0 0` overwrites (zeroes) the per-atom force
+# array for gbottom every step -- any compute reading that array afterward
+# is guaranteed to read exactly 0, which is why an earlier version of this
+# script reported v_stress = -0 for an entire run. `fix setforce` keeps its
+# own record of "the total force on the group before I zeroed it," exposed
+# as a global vector f_ID[1,2,3] (documented at docs.lammps.org/fix_setforce.html:
+# "This is the total force on the group of atoms before the forces on
+# individual atoms are changed by the fix."). That is the correct quantity
+# for the true reaction force at a rigid support, so use it directly.
+variable        Freact  equal f_fsetbot[2]                    # [eV/A] true reaction force at fixed grip
+variable        stress  equal -v_Freact/v_A0*160.21766208     # eV/A^3 -> GPa
+variable        ycur    equal xcm(gtop,y)
+variable        strain  equal (v_y0_top-v_ycur)/v_H0          # engineering compressive strain
+
+fix             favg all ave/time 100 1 100 v_strain v_stress file stress_strain.txt
+
+thermo          500
+thermo_style    custom step v_strain v_stress temp pe press
+
+dump            dtraj all custom 2000 dump.auxetic_compress.lammpstrj id type x y z fx fy fz
+dump_modify     dtraj sort id
+
+# ---------------------- 8. Run the compression --------------------------
+# Run to a target strain. IMPORTANT: a segment-to-segment clearance check
+# on generate_auxetic_lattice.py's current geometry gives ~1.5x the strut
+# diameter of gap between non-adjacent struts at ZERO strain. Compression
+# closes that gap further (that IS the auxetic mechanism -- the re-entrant
+# struts rotate closed, matching Plewa et al. 2024's own "blocking"
+# condition for these bow-tie cells), so pushing to large engineering
+# strain will eventually bring struts into contact BY DESIGN, not by
+# error. Start small and check dump frames in OVITO before committing to
+# a large strain_target.
+variable        strain_target equal 0.06
+variable        nsteps equal round(v_strain_target*v_H0/(-v_vy*dt))
+print           "Running ${nsteps} steps to reach ~${strain_target} engineering strain"
+
+run             ${nsteps}
+
+write_data      lattice_auxetic_compressed.data
